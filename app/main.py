@@ -18,9 +18,9 @@ def _env_list(key: str, default: str = "") -> List[str]:
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 BASE_URL: str = (os.getenv("BASE_URL") or "").rstrip("/")
-RESULTS_PATH: str = os.getenv("RESULTS_PATH", "")  # NO usamos aquí (porque tu portal usa path por segmentos)
 CORS_ALLOW_ORIGINS = _env_list("CORS_ALLOW_ORIGINS", "*")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+MOCK_PLANNER = os.getenv("MOCK_PLANNER", "0") == "1"  # set 1 para probar sin OpenAI
 
 # ========== LOG + REQ-ID ==========
 class RequestIdMiddleware(BaseHTTPMiddleware):
@@ -82,7 +82,6 @@ class PropertyFilters(BaseModel):
 
     # Dormitorios
     bedrooms_token: Optional[str] = None                    # "monoambiente" | "1".."10" | "+10"
-    # opcionalmente, el planner podría poner rangos:
     min_bedrooms: Optional[conint(ge=0)] = None
     max_bedrooms: Optional[conint(ge=0)] = None
 
@@ -141,7 +140,7 @@ PROPERTY_TYPES_CANON = {
     "estancias": ["estancia", "estancias"],
 }
 
-# canonical slug -> etiqueta EXACTA para tu portal (param "A")
+# Etiquetas EXACTAS para A/E/ES
 AMENITY_LABEL = {
     "acceso-controlado": "Acceso controlado",
     "area-de-coworking": "Área de coworking",
@@ -178,7 +177,6 @@ AMENITY_LABEL = {
     "cafe": "Café",
     "business-center": "Business center",
 }
-
 AMENITIES_CANON = {k: [k.replace("-", " "), AMENITY_LABEL[k].lower()] for k in AMENITY_LABEL.keys()}
 
 STYLE_LABEL = {
@@ -256,16 +254,12 @@ def normalize_bedrooms_token(token: Optional[str]) -> Tuple[Optional[str], Optio
 # ========== URL BUILDER ESPECÍFICO DE TU PORTAL ==========
 def build_portal_url(filters: PropertyFilters) -> str:
     """
-    Construye: https://tucasapy.com/{oper}/{tipo1}/{ciudad1}/{barrio1?}?...
-      - PD2..PD5: tipos extra
-      - C2..C5: ciudades extra
-      - B, B2..B5: barrios (solo si ciudad1 == 'asuncion')
-      - H, H2..H5: habitaciones (tokens)
-      - divisa: "$" | "GS"
-      - A, AM, E, ES, PL, PIMI, PIMA, M2MI, M2MA, HMI, HMA
+    https://tucasapy.com/{oper}/{tipo1}/{ciudad1}/{barrio1?}?PD2..PD5&C2..C5&B/B2..B5&H/H2..H5&divisa&... (etc.)
     """
+    if not BASE_URL:
+        raise MappingError("BASE_URL no configurada. Define BASE_URL en variables de entorno.")
 
-    # 1) Canonizar algunos campos a nuestros canónicos
+    # 1) Canonizar a nuestros catálogos
     types_canon = canonize_list(filters.property_type, PROPERTY_TYPES_CANON)
     ams_canon   = canonize_list(filters.amenities, AMENITIES_CANON)
     styles_canon= canonize_list(filters.styles, STYLE_CANON)
@@ -274,24 +268,19 @@ def build_portal_url(filters: PropertyFilters) -> str:
     furnished_c = canonize(filters.furnished, FURNISHED_CANON) if isinstance(filters.furnished, str) else filters.furnished
 
     # 2) Path segments
-    oper = (filters.operation or "venta").strip().lower()  # por defecto "venta"
-    tipo1 = types_canon[0] if types_canon else ""          # ej: "departamentos"
+    oper = (filters.operation or "venta").strip().lower()
+    tipo1 = types_canon[0] if types_canon else ""
     city1 = (filters.city[0].strip().lower() if filters.city else "")
     barrio1 = (filters.neighborhood[0].strip().lower() if filters.neighborhood else "")
 
-    # El barrio va en el path SOLO si la ciudad principal es asuncion y hay barrio
     include_barrio_in_path = (city1 == "asuncion" and bool(barrio1))
-
-    # construimos el path
     path_parts = [p for p in [oper, tipo1, city1, (barrio1 if include_barrio_in_path else None)] if p]
-    if not BASE_URL:
-        raise MappingError("BASE_URL no configurada. Define BASE_URL en variables de entorno.")
     base_path = "/".join([BASE_URL.rstrip("/")] + path_parts)
 
-    # 3) Query params según tu esquema
+    # 3) Query params
     params: Dict[str, Any] = {}
 
-    # Tipos extra: PD2..PD5 (máx 4 adicionales)
+    # Tipos extra: PD2..PD5
     for i, t in enumerate(types_canon[1:5], start=2):
         params[f"PD{i}"] = t
 
@@ -299,9 +288,8 @@ def build_portal_url(filters: PropertyFilters) -> str:
     for i, c in enumerate([slugify(x) for x in filters.city[1:5]], start=2):
         params[f"C{i}"] = c
 
-    # Barrios: si ciudad principal es asuncion
+    # Barrios (solo si ciudad principal es asuncion)
     if city1 == "asuncion" and filters.neighborhood:
-        # B (principal) y B2..B5 (resto)
         params["B"] = slugify(filters.neighborhood[0])
         for i, b in enumerate([slugify(x) for x in filters.neighborhood[1:5]], start=2):
             params[f"B{i}"] = b
@@ -310,21 +298,17 @@ def build_portal_url(filters: PropertyFilters) -> str:
     tokens: List[str] = []
     tok, tmin, tmax = normalize_bedrooms_token(filters.bedrooms_token) if filters.bedrooms_token else (None, None, None)
     if tok: tokens.append(tok)
-    # si vinieron min/max y forman exacto, añadimos (evita duplicados)
     if filters.min_bedrooms is not None and filters.max_bedrooms is not None and filters.min_bedrooms == filters.max_bedrooms:
         t2 = str(filters.min_bedrooms)
         if t2 not in tokens: tokens.append(t2)
-    # cargar hasta 5 (H, H2..H5)
     if tokens:
         params["H"] = tokens[0]
         for i, t in enumerate(tokens[1:5], start=2):
             params[f"H{i}"] = t
 
     # divisa: "$" | "GS"
-    if currency_c == "usd":
-        params["divisa"] = "$"
-    elif currency_c == "gs":
-        params["divisa"] = "GS"
+    if currency_c == "usd": params["divisa"] = "$"
+    elif currency_c == "gs": params["divisa"] = "GS"
 
     # Precios
     if filters.min_price is not None: params["Precio-min"] = filters.min_price
@@ -332,7 +316,7 @@ def build_portal_url(filters: PropertyFilters) -> str:
 
     # Amenidad preferida (una): A
     if ams_canon:
-        first_amenity = ams_canon[0]   # canonical slug
+        first_amenity = ams_canon[0]
         params["A"] = AMENITY_LABEL.get(first_amenity, first_amenity)
 
     # Amoblado: AM (Sí|No)
@@ -347,9 +331,6 @@ def build_portal_url(filters: PropertyFilters) -> str:
     if conds_canon:
         params["ES"] = CONDITION_LABEL.get(conds_canon[0], conds_canon[0])
 
-    # Plantas (PL) -> opcional (no lo estamos mapeando aún)
-    # if filters.floors is not None: params["PL"] = filters.floors
-
     # Piso mínimo/máximo
     if filters.min_floor is not None: params["PIMI"] = filters.min_floor
     if filters.max_floor is not None: params["PIMA"] = filters.max_floor
@@ -362,10 +343,67 @@ def build_portal_url(filters: PropertyFilters) -> str:
     if filters.min_hectares is not None: params["HMI"] = filters.min_hectares
     if filters.max_hectares is not None: params["HMA"] = filters.max_hectares
 
-    # Nota: NO seteamos "página", lo maneja tu front.
-
     query = qs(params)
     return f"{base_path}?{query}" if query else base_path
+
+# ========== FALLBACK: completa lo obvio si el LLM dejó vacío ==========
+def fallback_enrich_plan(plan: SearchPlan, q: str) -> SearchPlan:
+    text = q.lower()
+    f = plan.must_filters
+
+    # operación
+    if not f.operation:
+        f.operation = "alquiler" if ("alquiler" in text or "renta" in text or "alquilar" in text) else "venta"
+
+    # tipo
+    if not f.property_type:
+        for canon, syns in PROPERTY_TYPES_CANON.items():
+            if any(s in text for s in syns + [canon]):
+                f.property_type = [canon]
+                break
+        if not f.property_type and ("depto" in text or "depart" in text or "departamentos" in text):
+            f.property_type = ["departamentos"]
+
+    # ciudad
+    if not f.city:
+        if "asuncion" in text or "asunción" in text: f.city = ["asuncion"]
+        elif "luque" in text: f.city = ["luque"]
+        elif "villa elisa" in text: f.city = ["villa-elisa"]
+        elif "san lorenzo" in text: f.city = ["san-lorenzo"]
+
+    # barrio (si asuncion)
+    if not f.neighborhood and (f.city and f.city[0] == "asuncion"):
+        if "villa morra" in text: f.neighborhood = ["villa-morra"]
+        elif "recoleta" in text: f.neighborhood = ["recoleta"]
+
+    # divisa
+    if not f.currency:
+        if "$" in text or "usd" in text or "dolar" in text or "dólar" in text: f.currency = "usd"
+        elif "gs" in text or "guaran" in text: f.currency = "gs"
+
+    # precio max
+    if f.max_price is None:
+        m = re.search(r"(\d[\d\.]{3,})\s*(usd|\$|gs)?", text)
+        if m:
+            f.max_price = int(m.group(1).replace(".", ""))
+
+    # dormitorios
+    if not f.bedrooms_token:
+        if "monoambiente" in text: f.bedrooms_token = "monoambiente"
+        else:
+            m = re.search(r"(\d+)\s*(dorm|habit)", text)
+            if m: f.bedrooms_token = m.group(1)
+
+    # amenidad preferida
+    if not f.amenities:
+        if "piscina" in text or "pileta" in text: f.amenities = ["piscina"]
+        else:
+            for canon in AMENITIES_CANON.keys():
+                label = canon.replace("-", " ")
+                if label in text or canon in text:
+                    f.amenities = [canon]
+                    break
+    return plan
 
 # ========== PLANNER (OpenAI) ==========
 PLANNER_SYS = """Eres un planificador de búsqueda inmobiliaria para Paraguay.
@@ -399,7 +437,14 @@ def build_planner_user(q: str) -> str:
     }
     return json.dumps(template, ensure_ascii=False)
 
+def naive_plan_from_text(q: str) -> SearchPlan:
+    """Planner básico sin OpenAI (solo para pruebas)."""
+    plan = SearchPlan(must_filters=PropertyFilters())
+    return fallback_enrich_plan(plan, q)
+
 def run_planner(q: str) -> SearchPlan:
+    if MOCK_PLANNER:
+        return naive_plan_from_text(q)
     if not OPENAI_API_KEY:
         raise PlannerError("Falta OPENAI_API_KEY en el entorno para usar el planner.")
     try:
@@ -426,7 +471,7 @@ def run_planner(q: str) -> SearchPlan:
         raise ExternalServiceError("Error al consultar OpenAI")
 
 # ========== FASTAPI ==========
-app = FastAPI(title="Tu Casa - NL Search API", version="2.0.0")
+app = FastAPI(title="Tu Casa - NL Search API", version="2.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"] if CORS_ALLOW_ORIGINS == ["*"] else CORS_ALLOW_ORIGINS,
@@ -452,11 +497,19 @@ def health():
 
 @app.post("/nl-search/plan", response_model=NLPlanResponse)
 def nl_search_plan(req: NLQueryRequest):
-    # 1) Planner
+    # 1) Planner (OpenAI o mock)
     plan = run_planner(req.q)
 
-    # 2) Construir URL exacta del portal
+    # 2) Fallback para rellenar lo obvio si faltó algo
+    plan = fallback_enrich_plan(plan, req.q)
+
+    # 3) Construir URL exacta del portal
     url = build_portal_url(plan.must_filters)
 
-    # 3) Responder (puedes quitar debug_plan en prod)
-    return NLPlanResponse(url=url, filters=plan.must_filters, explain_to_user=plan.explain_to_user, debug_plan=plan)
+    # 4) Respuesta
+    return NLPlanResponse(
+        url=url,
+        filters=plan.must_filters,
+        explain_to_user=plan.explain_to_user,
+        debug_plan=plan,  # quítalo si no querés exponerlo
+    )
